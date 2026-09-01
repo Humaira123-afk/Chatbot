@@ -42,6 +42,10 @@ st.caption("Real StateGraph loop • Local Ollama model • Human-in-the-loop �
 # ─────────────────────────────────────────────────────────────
 class AgentState(TypedDict):
     user_query: str
+    task_list: list
+    current_task_index: int
+    current_task_query: str
+    all_outputs: list
     next_step: str
     tool_output: str
     review_status: str
@@ -464,19 +468,32 @@ def fallback_tool(query: str, model: str) -> str:
 
 
 TOOL_MAP = {
-    "LINKEDIN": lambda state: linkedin_tool(state["user_query"]),
-    "GMAIL": lambda state: gmail_tool(state["user_query"]),
-    "FIGMA": lambda state: figma_tool(state["user_query"]),
-    "MIRO": lambda state: miro_tool(state["user_query"], state["model"], state.get("miro_test_mode", False)),
-    "BLENDER": lambda state: blender_tool(state["user_query"]),
-    "FALLBACK": lambda state: fallback_tool(state["user_query"], state["model"]),
+    "LINKEDIN": lambda state: linkedin_tool(state["current_task_query"]),
+    "GMAIL": lambda state: gmail_tool(state["current_task_query"]),
+    "FIGMA": lambda state: figma_tool(state["current_task_query"]),
+    "MIRO": lambda state: miro_tool(state["current_task_query"], state["model"], state.get("miro_test_mode", False)),
+    "BLENDER": lambda state: blender_tool(state["current_task_query"]),
+    "FALLBACK": lambda state: fallback_tool(state["current_task_query"], state["model"]),
 }
 
 # ─────────────────────────────────────────────────────────────
 # 5. GRAPH NODES (this is the actual autonomous loop)
 # ─────────────────────────────────────────────────────────────
+PLANNER_SYSTEM = """You are a task planner for a multi-agent system.
+Break the user's message into an ORDERED list of separate, atomic sub-tasks.
+Each sub-task should map to exactly ONE tool action (e.g. one board creation,
+one board lookup, one email, one LinkedIn post, one Blender render, etc).
+
+Reply with ONLY a JSON array of strings, nothing else — no markdown fences, no explanation.
+Example:
+["make a miro board named New Team with sticky notes cat, parrot, fish",
+ "show me what's on the marketing ideas miro board",
+ "send an email to jane@example.com saying the meeting is at 5pm"]
+
+If the message is already a single simple task, return an array with just that one string."""
+
 SUPERVISOR_SYSTEM = """You are a routing supervisor for a multi-agent system.
-Given a user's request, decide which single tool should handle it.
+Given a single task, decide which tool should handle it.
 Valid tools: LINKEDIN, GMAIL, FIGMA, MIRO, BLENDER, FALLBACK.
 Reply with ONLY the tool name, nothing else, no punctuation."""
 
@@ -484,12 +501,37 @@ REVIEWER_SYSTEM = """You are a strict QA reviewer for an agent's tool output.
 Note: outputs starting with "[SIMULATED]", "✅", or "🧪 TEST MODE" are SUCCESSFUL outputs,
 not errors — they mean the tool ran correctly (real, simulated, or test-mode preview).
 These should be PASSED. Only reply FAILED if the output starts with an error tag like
-"[GMAIL ERROR]", "[LLM ERROR]", is empty, or clearly ignores the user's request.
+"[GMAIL ERROR]", "[LLM ERROR]", is empty, or clearly ignores the task.
 Reply with exactly one word: PASSED or FAILED. No punctuation, no explanation."""
 
 
+def planner_node(state: AgentState) -> Dict:
+    """
+    Split the user's raw message into an ordered list of atomic sub-tasks.
+    This is what makes multi-part requests ("make a board AND email someone")
+    actually work — each piece becomes its own task that loops through
+    supervisor -> executor -> reviewer on its own.
+    """
+    raw = call_local_llm(state["user_query"], model=state["model"], system=PLANNER_SYSTEM)
+    cleaned = re.sub(r'^```(json)?|```$', '', raw.strip(), flags=re.MULTILINE).strip()
+    try:
+        tasks = json.loads(cleaned)
+        tasks = [str(t).strip() for t in tasks if str(t).strip()]
+    except Exception:
+        tasks = []
+    if not tasks:
+        tasks = [state["user_query"]]  # fallback: treat the whole message as one task
+    return {
+        "task_list": tasks,
+        "current_task_index": 0,
+        "current_task_query": tasks[0],
+        "all_outputs": [],
+        "iterations": 0,
+    }
+
+
 def supervisor_router_node(state: AgentState) -> Dict:
-    raw = call_local_llm(state["user_query"], model=state["model"], system=SUPERVISOR_SYSTEM)
+    raw = call_local_llm(state["current_task_query"], model=state["model"], system=SUPERVISOR_SYSTEM)
     choice = raw.strip().upper()
     valid = {"LINKEDIN", "GMAIL", "FIGMA", "MIRO", "BLENDER", "FALLBACK"}
     next_step = choice if choice in valid else "FALLBACK"
@@ -504,32 +546,62 @@ def tool_execution_node(state: AgentState) -> Dict:
 
 
 def reviewer_quality_node(state: AgentState) -> Dict:
-    verdict_prompt = f"User request: {state['user_query']}\nTool output: {state['tool_output']}"
+    verdict_prompt = f"Task: {state['current_task_query']}\nTool output: {state['tool_output']}"
     raw = call_local_llm(verdict_prompt, model=state["model"], system=REVIEWER_SYSTEM).strip().upper()
     status = "PASSED" if "PASSED" in raw else "FAILED"
     return {"review_status": status}
 
 
+def advance_task_node(state: AgentState) -> Dict:
+    """
+    Called after a task is done (passed, or retries exhausted). Banks the
+    result, moves on to the next sub-task in the list, and resets the
+    retry counter for it.
+    """
+    all_outputs = state.get("all_outputs", []) + [
+        f"[{state['current_task_query']}] → {state['tool_output']}"
+    ]
+    next_index = state["current_task_index"] + 1
+    return {
+        "all_outputs": all_outputs,
+        "current_task_index": next_index,
+        "current_task_query": state["task_list"][next_index],
+        "iterations": 0,
+        "review_status": "PENDING",
+    }
+
+
 def route_after_review(state: AgentState) -> str:
     if state["review_status"] == "FAILED" and state["iterations"] < state.get("max_iterations", 2):
         return "retry"
+    if state["current_task_index"] + 1 < len(state["task_list"]):
+        return "next_task"
     return "end"
 
 
 def build_graph():
     graph = StateGraph(AgentState)
+    graph.add_node("planner", planner_node)
     graph.add_node("supervisor", supervisor_router_node)
     graph.add_node("executor", tool_execution_node)
     graph.add_node("reviewer", reviewer_quality_node)
-    graph.set_entry_point("supervisor")
+    graph.add_node("advance_task", advance_task_node)
+
+    graph.set_entry_point("planner")
+    graph.add_edge("planner", "supervisor")
     graph.add_edge("supervisor", "executor")
     graph.add_edge("executor", "reviewer")
-    graph.add_conditional_edges("reviewer", route_after_review, {"retry": "executor", "end": END})
+    graph.add_conditional_edges(
+        "reviewer", route_after_review,
+        {"retry": "executor", "next_task": "advance_task", "end": END},
+    )
+    graph.add_edge("advance_task", "supervisor")
 
     checkpointer = MemorySaver()
-    # HUMAN-IN-THE-LOOP: the graph pauses right before "executor" runs.
-    # Nothing (email, LinkedIn post, etc.) actually happens until the human
-    # clicks "Approve" in the UI below.
+    # HUMAN-IN-THE-LOOP: the graph pauses right before EVERY "executor" run —
+    # meaning before EACH sub-task's real action, not just the first one.
+    # Nothing (email, board, post, etc.) actually happens until the human
+    # clicks "Approve" in the UI below, for every single step.
     return graph.compile(checkpointer=checkpointer, interrupt_before=["executor"])
 
 
@@ -592,7 +664,8 @@ for msg in st.session_state.agent_memory:
         st.write(msg["content"])
 
 user_intent = st.chat_input(
-    "e.g., 'Email ali@example.com and tell him the meeting is at 5pm'..."
+    "e.g., 'Make a miro board named X with sticky notes A, B and email "
+    "ali@example.com saying hi'..."
 )
 
 if user_intent:
@@ -602,6 +675,10 @@ if user_intent:
 
     initial_state: AgentState = {
         "user_query": user_intent,
+        "task_list": [],
+        "current_task_index": 0,
+        "current_task_query": "",
+        "all_outputs": [],
         "next_step": "",
         "tool_output": "",
         "review_status": "PENDING",
@@ -611,9 +688,9 @@ if user_intent:
         "miro_test_mode": miro_test_mode,
     }
 
-    with st.spinner(f"Supervisor ({model_name}) deciding which tool to use..."):
+    with st.spinner(f"Planning tasks and deciding which tool to use ({model_name})..."):
         for _ in st.session_state.graph.stream(initial_state, config):
-            pass  # graph auto-pauses before "executor" because of interrupt_before
+            pass  # graph auto-pauses before the first "executor" call
 
     snap = st.session_state.graph.get_state(config)
     st.session_state.pending_action = snap.values
@@ -621,10 +698,15 @@ if user_intent:
 # ── Show approval UI if a tool call is waiting for human sign-off ──
 if st.session_state.pending_action:
     pending = st.session_state.pending_action
+    tasks = pending.get("task_list", [pending.get("user_query", "")])
+    task_num = pending.get("current_task_index", 0) + 1
+    total_tasks = len(tasks)
+
     with st.chat_message("assistant"):
+        progress_label = f" (task {task_num} of {total_tasks})" if total_tasks > 1 else ""
         st.warning(
-            f"🧠 **Supervisor** wants to run **{pending['next_step']}** "
-            f"for request: \"{pending['user_query']}\"\n\n"
+            f"🧠 **Supervisor** wants to run **{pending['next_step']}**{progress_label}\n\n"
+            f"Task: \"{pending['current_task_query']}\"\n\n"
             f"Approve to actually execute this tool (this may send a real email, "
             f"post publicly, etc. if that connector is Live)."
         )
@@ -641,16 +723,31 @@ if st.session_state.pending_action:
                         elif node_name == "reviewer":
                             badge = "✅" if node_output["review_status"] == "PASSED" else "⚠️"
                             st.write(f"{badge} **[Reviewer]** verdict: {node_output['review_status']}")
-            final = st.session_state.graph.get_state(config).values
-            st.success(f"Final status: {final['review_status']}")
-            st.session_state.agent_memory.append({"role": "assistant", "content": final["tool_output"]})
-            st.session_state.pending_action = None
+                        elif node_name == "advance_task":
+                            st.write("➡️ Moving on to the next task...")
+
+            snap = st.session_state.graph.get_state(config)
+
+            if snap.next:
+                # Graph paused again — either retrying this task or starting
+                # the next one in the plan. Show the approval UI again.
+                st.session_state.pending_action = snap.values
+            else:
+                # Whole plan finished — build a combined summary of every task.
+                final = snap.values
+                completed = list(final.get("all_outputs", []))
+                completed.append(f"[{final['current_task_query']}] → {final['tool_output']}")
+                summary = "\n\n".join(completed)
+                st.success(f"✅ All {len(tasks)} task(s) completed!" if total_tasks > 1 else "✅ Done!")
+                st.session_state.agent_memory.append({"role": "assistant", "content": summary})
+                st.session_state.pending_action = None
             st.rerun()
 
         if rejected:
-            st.info("Action cancelled by human review — nothing was executed.")
-            st.session_state.agent_memory.append(
-                {"role": "assistant", "content": "[Cancelled by human review — no tool was executed]"}
-            )
+            completed = pending.get("all_outputs", [])
+            note = "[Cancelled by human review — remaining task(s) were not executed]"
+            summary = "\n\n".join(completed + [note]) if completed else note
+            st.info("Action cancelled by human review — nothing further was executed.")
+            st.session_state.agent_memory.append({"role": "assistant", "content": summary})
             st.session_state.pending_action = None
             st.rerun()
