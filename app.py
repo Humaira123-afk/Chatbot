@@ -48,6 +48,7 @@ class AgentState(TypedDict):
     iterations: int
     max_iterations: int
     model: str
+    miro_test_mode: bool
 
 
 # ─────────────────────────────────────────────────────────────
@@ -162,75 +163,249 @@ def figma_tool(query: str) -> str:
         return f"[FIGMA ERROR] {e}"
 
 
-MIRO_PARSE_SYSTEM = """You extract structured data from a user's request to create a Miro board.
-Reply with ONLY valid JSON, nothing else — no markdown fences, no explanation, no extra text.
+MIRO_PARSE_SYSTEM = """You extract a structured action plan from a user's request about a Miro board.
+Reply with ONLY valid JSON, nothing else — no markdown fences, no explanation.
+
 Format exactly like this:
-{"board_name": "<short board title>", "notes": ["<note 1>", "<note 2>", ...]}
+{
+  "action": "create" or "edit" or "read",
+  "board_name": "<short board title, a few words — only used when action is 'create'>",
+  "target_board": "<name of an EXISTING board the user is referring to — only used when action is 'edit' or 'read'>",
+  "items": [
+    {"type": "sticky_note", "content": "<text>"},
+    {"type": "shape", "shape_type": "rectangle" or "circle" or "triangle", "content": "<text, can be empty>"},
+    {"type": "text", "content": "<text>"},
+    {"type": "frame", "content": "<frame title>"}
+  ],
+  "connectors": [
+    {"from": <0-based index into items>, "to": <0-based index into items>, "label": "<optional, can be empty>"}
+  ],
+  "images": ["<direct image URL>", ...]
+}
 
-Rules:
-- board_name should be a short, clean title (a few words), never the whole sentence.
-- notes should be a list of the individual sticky-note items the user mentioned,
-  in their own words, cleaned up (no surrounding quote marks).
-- If the user didn't mention any individual items/notes, return an empty list: []
-- Always return valid JSON matching the exact format above, nothing else."""
+Rules for "action":
+- "create": the user wants a brand NEW board. Use this by default if unclear.
+- "edit": the user wants to ADD something (sticky notes/shapes/etc.) to an EXISTING board they name or refer to.
+- "read": the user wants to SEE/LIST/CHECK what's already on an existing board, without adding anything.
+- If action is "edit" or "read", set "target_board" to the existing board's name as the user wrote it.
+- If action is "create", set "board_name" and leave "target_board" empty.
+
+Rules for the rest:
+- "items" is the ordered list of every sticky note / shape / text / frame the user mentioned. Preserve their order. Empty list [] if none (always empty for action "read").
+- "connectors" only if the user explicitly asked to connect/link/arrow between specific items. Empty list [] otherwise.
+- "images" only if the user gave an actual image URL. Empty list [] otherwise.
+- Always return valid JSON matching this exact structure, nothing else."""
 
 
-def parse_miro_request(query: str, model: str) -> Tuple[str, list]:
+def parse_miro_plan(query: str, model: str) -> dict:
     """
     Ask the local LLM to read the user's natural-language request and return
-    a clean board name + list of sticky notes as JSON. This replaces brittle
-    regex/quote-matching so ANY phrasing works, not just one exact pattern.
+    a full action plan (action type, board name/target, items, connectors,
+    images) as JSON. Fully dynamic — no hardcoded patterns.
     """
     raw = call_local_llm(query, model=model, system=MIRO_PARSE_SYSTEM)
     cleaned = re.sub(r'^```(json)?|```$', '', raw.strip(), flags=re.MULTILINE).strip()
     try:
         data = json.loads(cleaned)
-        board_name = str(data.get("board_name") or "Untitled Board").strip()[:60] or "Untitled Board"
-        notes = [str(n).strip() for n in data.get("notes", []) if str(n).strip()]
-        return board_name, notes
+        action = str(data.get("action") or "create").strip().lower()
+        if action not in ("create", "edit", "read"):
+            action = "create"
+        return {
+            "action": action,
+            "board_name": str(data.get("board_name") or "Untitled Board").strip()[:60] or "Untitled Board",
+            "target_board": str(data.get("target_board") or "").strip(),
+            "items": [i for i in data.get("items", []) if isinstance(i, dict) and i.get("type")],
+            "connectors": [c for c in data.get("connectors", []) if isinstance(c, dict)],
+            "images": [u for u in data.get("images", []) if isinstance(u, str) and u.strip()],
+        }
     except Exception:
-        # If the model didn't return clean JSON, fall back to a safe default
-        # instead of crashing — at least the board still gets created.
-        return query.strip()[:60] or "Untitled Board", []
+        # Model didn't return clean JSON — fall back to just a plain new board
+        # instead of crashing.
+        return {"action": "create", "board_name": query.strip()[:60] or "Untitled Board",
+                 "target_board": "", "items": [], "connectors": [], "images": []}
 
 
-def create_sticky_note(token: str, board_id: str, text: str, x: float, y: float) -> None:
-    requests.post(
-        f"https://api.miro.com/v2/boards/{board_id}/sticky_notes",
+def _miro_post(token: str, board_id: str, endpoint: str, payload: dict) -> str | None:
+    r = requests.post(
+        f"https://api.miro.com/v2/boards/{board_id}/{endpoint}",
         headers={"Authorization": f"Bearer {token}"},
-        json={
-            "data": {"content": text, "shape": "square"},
-            "style": {"fillColor": "light_yellow"},
-            "position": {"x": x, "y": y},
-        },
-        timeout=10,
+        json=payload, timeout=10,
     )
+    r.raise_for_status()
+    return r.json().get("id")
 
 
-def miro_tool(query: str, model: str) -> str:
+def find_board_by_name(token: str, name: str) -> str | None:
+    """Look up an existing board by (partial) name. Returns its ID, or None if not found."""
+    if not name:
+        return None
+    r = requests.get(
+        "https://api.miro.com/v2/boards",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"query": name}, timeout=10,
+    )
+    r.raise_for_status()
+    results = r.json().get("data", [])
+    return results[0]["id"] if results else None
+
+
+def list_board_items(token: str, board_id: str) -> list:
+    """Fetch every item currently on a board, as (type, short content) pairs."""
+    r = requests.get(
+        f"https://api.miro.com/v2/boards/{board_id}/items",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"limit": 50}, timeout=10,
+    )
+    r.raise_for_status()
+    items = r.json().get("data", [])
+    summary = []
+    for it in items:
+        content = (it.get("data") or {}).get("content", "") or (it.get("data") or {}).get("title", "")
+        content = re.sub(r'<[^>]+>', '', content).strip()  # strip Miro's HTML formatting
+        summary.append(f"{it.get('type', 'item')}: {content or '(no text)'}")
+    return summary
+
+
+def describe_miro_plan(plan: dict) -> str:
+    """Human-readable preview of a plan — used by Test Mode so nothing real is created."""
+    action = plan["action"]
+    if action == "read":
+        return f"🧪 TEST MODE — would look up board \"{plan['target_board']}\" and list its contents (no changes made)."
+    lines = ["🧪 TEST MODE — nothing was created/changed on Miro. Here's what WOULD happen:"]
+    if action == "create":
+        lines.append(f"• New board: \"{plan['board_name']}\"")
+    else:
+        lines.append(f"• Add to EXISTING board: \"{plan['target_board']}\"")
+    for i, item in enumerate(plan["items"]):
+        extra = f" ({item.get('shape_type')})" if item.get("type") == "shape" else ""
+        lines.append(f"• Item {i}: {item.get('type')}{extra} — \"{item.get('content', '')}\"")
+    for c in plan["connectors"]:
+        label = f" labeled \"{c.get('label')}\"" if c.get("label") else ""
+        lines.append(f"• Connector: item {c.get('from')} → item {c.get('to')}{label}")
+    for url in plan["images"]:
+        lines.append(f"• Image: {url}")
+    if not plan["items"] and not plan["connectors"] and not plan["images"]:
+        lines.append("• (just a blank board, no items)")
+    lines.append("\nTurn OFF Test Mode in the sidebar when this looks right, then run it again to do it for real.")
+    return "\n".join(lines)
+
+
+def add_items_to_board(token: str, board_id: str, plan: dict, x_start: float = 0) -> Tuple[int, int, int]:
+    """Create every item/connector/image in `plan` on an existing board_id. Returns counts."""
+    item_ids = []
+    x = x_start
+    for item in plan["items"]:
+        item_type = item.get("type")
+        content = item.get("content", "")
+        new_id = None
+        try:
+            if item_type == "sticky_note":
+                new_id = _miro_post(token, board_id, "sticky_notes", {
+                    "data": {"content": content, "shape": "square"},
+                    "style": {"fillColor": "light_yellow"},
+                    "position": {"x": x, "y": 0},
+                })
+            elif item_type == "shape":
+                new_id = _miro_post(token, board_id, "shapes", {
+                    "data": {"shape": item.get("shape_type", "rectangle"), "content": content},
+                    "position": {"x": x, "y": 250},
+                })
+            elif item_type == "text":
+                new_id = _miro_post(token, board_id, "texts", {
+                    "data": {"content": content},
+                    "position": {"x": x, "y": 500},
+                })
+            elif item_type == "frame":
+                new_id = _miro_post(token, board_id, "frames", {
+                    "data": {"title": content},
+                    "position": {"x": x, "y": 750},
+                    "geometry": {"width": 300, "height": 300},
+                })
+        except Exception:
+            new_id = None  # one bad item shouldn't stop the rest
+        item_ids.append(new_id)
+        x += 220
+
+    connectors_made = 0
+    for c in plan["connectors"]:
+        frm, to = c.get("from"), c.get("to")
+        if isinstance(frm, int) and isinstance(to, int) and 0 <= frm < len(item_ids) and 0 <= to < len(item_ids):
+            start_id, end_id = item_ids[frm], item_ids[to]
+            if start_id and end_id:
+                payload = {"startItem": {"id": start_id}, "endItem": {"id": end_id}}
+                if c.get("label"):
+                    payload["captions"] = [{"content": c["label"]}]
+                try:
+                    _miro_post(token, board_id, "connectors", payload)
+                    connectors_made += 1
+                except Exception:
+                    pass
+
+    images_made = 0
+    for url in plan["images"]:
+        try:
+            _miro_post(token, board_id, "images", {"data": {"url": url}, "position": {"x": x, "y": 1000}})
+            x += 220
+            images_made += 1
+        except Exception:
+            pass
+
+    return len(plan["items"]), connectors_made, images_made
+
+
+def miro_tool(query: str, model: str, test_mode: bool = False) -> str:
+    plan = parse_miro_plan(query, model)
+
+    if test_mode:
+        return describe_miro_plan(plan)
+
     token = os.environ.get("MIRO_TOKEN")
-    board_name, notes = parse_miro_request(query, model)
-
     if not token:
-        note_preview = f" + sticky notes: {notes}" if notes else ""
-        return f"[SIMULATED] Would create Miro board '{board_name}'{note_preview} " \
+        return f"[SIMULATED] Would run Miro plan: {plan} " \
                f"(set MIRO_TOKEN, from a Miro developer app, to connect for real)"
+
     try:
-        r = requests.post(
-            "https://api.miro.com/v2/boards",
-            headers={"Authorization": f"Bearer {token}"},
-            json={"name": board_name}, timeout=10,
-        )
-        r.raise_for_status()
-        board_id = r.json().get("id", "unknown")
+        if plan["action"] == "read":
+            board_id = find_board_by_name(token, plan["target_board"])
+            if not board_id:
+                return f"[MIRO ERROR] Couldn't find a board named '{plan['target_board']}'"
+            contents = list_board_items(token, board_id)
+            if not contents:
+                return f"✅ Board '{plan['target_board']}' found — it's empty."
+            listing = "\n".join(f"  • {c}" for c in contents)
+            return f"✅ Contents of '{plan['target_board']}':\n{listing}"
 
-        # Lay sticky notes out in a horizontal row, spaced apart so they
-        # don't overlap.
-        for i, note_text in enumerate(notes):
-            create_sticky_note(token, board_id, note_text, x=i * 220, y=0)
+        elif plan["action"] == "edit":
+            board_id = find_board_by_name(token, plan["target_board"])
+            if not board_id:
+                return f"[MIRO ERROR] Couldn't find a board named '{plan['target_board']}' to edit"
+            n_items, n_conn, n_img = add_items_to_board(token, board_id, plan)
+            summary = f"✅ Updated board '{plan['target_board']}'"
+            if n_items:
+                summary += f", added {n_items} item(s)"
+            if n_conn:
+                summary += f", {n_conn} connector(s)"
+            if n_img:
+                summary += f", {n_img} image(s)"
+            return summary
 
-        notes_msg = f" with {len(notes)} sticky note(s)" if notes else ""
-        return f"✅ Real Miro board created: {board_id}{notes_msg}"
+        else:  # create
+            r = requests.post(
+                "https://api.miro.com/v2/boards",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"name": plan["board_name"]}, timeout=10,
+            )
+            r.raise_for_status()
+            board_id = r.json().get("id", "unknown")
+            n_items, n_conn, n_img = add_items_to_board(token, board_id, plan)
+            summary = f"✅ Real Miro board created: {board_id}"
+            if n_items:
+                summary += f", {n_items} item(s)"
+            if n_conn:
+                summary += f", {n_conn} connector(s)"
+            if n_img:
+                summary += f", {n_img} image(s)"
+            return summary
     except Exception as e:
         return f"[MIRO ERROR] {e}"
 
@@ -289,12 +464,12 @@ def fallback_tool(query: str, model: str) -> str:
 
 
 TOOL_MAP = {
-    "LINKEDIN": lambda q, model: linkedin_tool(q),
-    "GMAIL": lambda q, model: gmail_tool(q),
-    "FIGMA": lambda q, model: figma_tool(q),
-    "MIRO": lambda q, model: miro_tool(q, model),
-    "BLENDER": lambda q, model: blender_tool(q),
-    "FALLBACK": lambda q, model: fallback_tool(q, model),
+    "LINKEDIN": lambda state: linkedin_tool(state["user_query"]),
+    "GMAIL": lambda state: gmail_tool(state["user_query"]),
+    "FIGMA": lambda state: figma_tool(state["user_query"]),
+    "MIRO": lambda state: miro_tool(state["user_query"], state["model"], state.get("miro_test_mode", False)),
+    "BLENDER": lambda state: blender_tool(state["user_query"]),
+    "FALLBACK": lambda state: fallback_tool(state["user_query"], state["model"]),
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -306,9 +481,9 @@ Valid tools: LINKEDIN, GMAIL, FIGMA, MIRO, BLENDER, FALLBACK.
 Reply with ONLY the tool name, nothing else, no punctuation."""
 
 REVIEWER_SYSTEM = """You are a strict QA reviewer for an agent's tool output.
-Note: outputs starting with "[SIMULATED]" or "✅" are SUCCESSFUL outputs, not errors —
-they mean the tool ran correctly (either in simulated demo mode or for real). These
-should be PASSED. Only reply FAILED if the output starts with an error tag like
+Note: outputs starting with "[SIMULATED]", "✅", or "🧪 TEST MODE" are SUCCESSFUL outputs,
+not errors — they mean the tool ran correctly (real, simulated, or test-mode preview).
+These should be PASSED. Only reply FAILED if the output starts with an error tag like
 "[GMAIL ERROR]", "[LLM ERROR]", is empty, or clearly ignores the user's request.
 Reply with exactly one word: PASSED or FAILED. No punctuation, no explanation."""
 
@@ -323,7 +498,7 @@ def supervisor_router_node(state: AgentState) -> Dict:
 
 def tool_execution_node(state: AgentState) -> Dict:
     fn = TOOL_MAP.get(state["next_step"], TOOL_MAP["FALLBACK"])
-    output = fn(state["user_query"], state["model"])
+    output = fn(state)
     iterations = state.get("iterations", 0) + 1
     return {"tool_output": output, "iterations": iterations}
 
@@ -371,6 +546,18 @@ with st.sidebar:
             st.warning("Ollama server not reachable — is `ollama serve` running?")
     model_name = st.selectbox("Model", available_models)
     max_iterations = st.slider("Max self-correction retries", 1, 4, 2)
+
+    st.write("---")
+    st.header("🧪 Testing")
+    miro_test_mode = st.checkbox(
+        "Miro Test Mode (preview only, no real API calls)", value=True
+    )
+    st.caption(
+        "Keep this ON while you're experimenting with prompts — it shows you "
+        "exactly what would be created without touching your real Miro "
+        "account or using up API rate limits. Turn it OFF only when you're "
+        "ready to actually create things for real."
+    )
 
     st.write("---")
     st.header("🔌 Connector Status")
@@ -421,6 +608,7 @@ if user_intent:
         "iterations": 0,
         "max_iterations": max_iterations,
         "model": model_name,
+        "miro_test_mode": miro_test_mode,
     }
 
     with st.spinner(f"Supervisor ({model_name}) deciding which tool to use..."):
