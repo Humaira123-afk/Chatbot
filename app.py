@@ -9,6 +9,18 @@ from typing import Dict, Tuple, TypedDict
 import requests
 import streamlit as st
 
+# Load all credentials from a local .env file (if present) into os.environ.
+# This means GMAIL_USER, MIRO_TOKEN, FIGMA_TOKEN, etc. can ALL live together
+# in one file instead of being set one-by-one in the terminal each session.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    st.warning(
+        "`python-dotenv` not installed — .env file won't be read automatically. "
+        "Run: pip install python-dotenv"
+    )
+
 try:
     import ollama
 except ImportError:
