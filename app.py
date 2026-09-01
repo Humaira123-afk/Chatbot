@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import subprocess
@@ -161,20 +162,75 @@ def figma_tool(query: str) -> str:
         return f"[FIGMA ERROR] {e}"
 
 
-def miro_tool(query: str) -> str:
+MIRO_PARSE_SYSTEM = """You extract structured data from a user's request to create a Miro board.
+Reply with ONLY valid JSON, nothing else — no markdown fences, no explanation, no extra text.
+Format exactly like this:
+{"board_name": "<short board title>", "notes": ["<note 1>", "<note 2>", ...]}
+
+Rules:
+- board_name should be a short, clean title (a few words), never the whole sentence.
+- notes should be a list of the individual sticky-note items the user mentioned,
+  in their own words, cleaned up (no surrounding quote marks).
+- If the user didn't mention any individual items/notes, return an empty list: []
+- Always return valid JSON matching the exact format above, nothing else."""
+
+
+def parse_miro_request(query: str, model: str) -> Tuple[str, list]:
+    """
+    Ask the local LLM to read the user's natural-language request and return
+    a clean board name + list of sticky notes as JSON. This replaces brittle
+    regex/quote-matching so ANY phrasing works, not just one exact pattern.
+    """
+    raw = call_local_llm(query, model=model, system=MIRO_PARSE_SYSTEM)
+    cleaned = re.sub(r'^```(json)?|```$', '', raw.strip(), flags=re.MULTILINE).strip()
+    try:
+        data = json.loads(cleaned)
+        board_name = str(data.get("board_name") or "Untitled Board").strip()[:60] or "Untitled Board"
+        notes = [str(n).strip() for n in data.get("notes", []) if str(n).strip()]
+        return board_name, notes
+    except Exception:
+        # If the model didn't return clean JSON, fall back to a safe default
+        # instead of crashing — at least the board still gets created.
+        return query.strip()[:60] or "Untitled Board", []
+
+
+def create_sticky_note(token: str, board_id: str, text: str, x: float, y: float) -> None:
+    requests.post(
+        f"https://api.miro.com/v2/boards/{board_id}/sticky_notes",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "data": {"content": text, "shape": "square"},
+            "style": {"fillColor": "light_yellow"},
+            "position": {"x": x, "y": y},
+        },
+        timeout=10,
+    )
+
+
+def miro_tool(query: str, model: str) -> str:
     token = os.environ.get("MIRO_TOKEN")
+    board_name, notes = parse_miro_request(query, model)
+
     if not token:
-        return f"[SIMULATED] Would create Miro board for: '{query}' " \
+        note_preview = f" + sticky notes: {notes}" if notes else ""
+        return f"[SIMULATED] Would create Miro board '{board_name}'{note_preview} " \
                f"(set MIRO_TOKEN, from a Miro developer app, to connect for real)"
     try:
         r = requests.post(
             "https://api.miro.com/v2/boards",
             headers={"Authorization": f"Bearer {token}"},
-            json={"name": query[:60]}, timeout=10,
+            json={"name": board_name}, timeout=10,
         )
         r.raise_for_status()
         board_id = r.json().get("id", "unknown")
-        return f"✅ Real Miro board created: {board_id}"
+
+        # Lay sticky notes out in a horizontal row, spaced apart so they
+        # don't overlap.
+        for i, note_text in enumerate(notes):
+            create_sticky_note(token, board_id, note_text, x=i * 220, y=0)
+
+        notes_msg = f" with {len(notes)} sticky note(s)" if notes else ""
+        return f"✅ Real Miro board created: {board_id}{notes_msg}"
     except Exception as e:
         return f"[MIRO ERROR] {e}"
 
@@ -236,7 +292,7 @@ TOOL_MAP = {
     "LINKEDIN": lambda q, model: linkedin_tool(q),
     "GMAIL": lambda q, model: gmail_tool(q),
     "FIGMA": lambda q, model: figma_tool(q),
-    "MIRO": lambda q, model: miro_tool(q),
+    "MIRO": lambda q, model: miro_tool(q, model),
     "BLENDER": lambda q, model: blender_tool(q),
     "FALLBACK": lambda q, model: fallback_tool(q, model),
 }
