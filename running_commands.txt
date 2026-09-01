@@ -1,0 +1,3 @@
+install this on your terminal: !pip install streamlit groq pyngrok -q
+use this after writing code in app.py for running the code: 
+!streamlit run app.py & npx localtunnel --port 8501
